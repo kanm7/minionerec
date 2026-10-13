@@ -11,14 +11,22 @@ The stages write normal `.npy`, `.index.json`, CSV and Hugging Face checkpoint
 artifacts, so the existing `convert_dataset.py`, `sft.py`, `rl.py` and
 `evaluate.py` remain the downstream entry points.
 
-## 1. Image-derived product attributes and text embeddings
+## 1. Product image-text joint embeddings
 
-### Two-stage scene-independent product representation
+### Two-stage multimodal product representation
 
 Stage 1 uses the existing Qwen3-VL Instruct model to extract target-product
 attributes from metadata and product images. The prompt excludes people, hands,
-backgrounds, lighting and camera composition. Stage 2 embeds only canonical text
-using the existing Qwen3-VL-Embedding model; no new model is trained.
+backgrounds, lighting and camera composition. Stage 2 jointly embeds the product
+image and the structured product text using Qwen3-VL-Embedding; no new embedding
+model is trained. The intended method is image-text joint embedding, not
+image-only embedding or text-only embedding. Attribute normalization aims to
+focus the textual description on the product; it does not prove that the joint
+encoder ignores visual backgrounds or shooting conditions.
+
+The current scripts still default to `--embedding_mode text`. Explicitly pass
+`--embedding_mode joint` for the intended method. Text-only runs are comparison
+experiments and must be reported separately from joint runs.
 
 The v2 schema includes product type, brand, model, compatible model, function,
 material, color, pattern, specifications, structural features and intended use.
@@ -87,23 +95,28 @@ Start the local embedding server with
 python rq/text2emb/amazon23_summary_image_embed.py \
   --catalog data/Amazon23/Office_Products_top3000/Office_Products.local.item.jsonl \
   --summary_path output/Office_Products_top3000.attributes-v2.jsonl \
-  --output_dir output/amazon23_top3000_attributes_text \
-  --model D:/sofaware/Qwen3-VL-Embedding-8B-Q4_K_M/Qwen3-VL-Embedding-8B-Q4_K_M.gguf
+  --output_dir output/amazon23_top3000_attributes_joint \
+  --model D:/sofaware/Qwen3-VL-Embedding-8B-Q4_K_M/Qwen3-VL-Embedding-8B-Q4_K_M.gguf \
+  --mmproj D:/sofaware/Qwen3-VL-Embedding-8B-Q4_K_M/Qwen3-VL-Embedding-8B.mmproj-f16.gguf \
+  --embedding_mode joint
 ```
 
 Use matching `--start` and `--limit` for bounded runs. Stage 1 requires a
 readable image; failures are recorded and retried on restart. Only explicit
 `--allow_missing_images` permits metadata-only extraction. Resume accepts only
 v2 successful records; use a new summary file for migration from old summaries.
-Stage 2 never loads images in its default `--embedding_mode text`. It needs no
-vision projector. `--embedding_mode joint` is retained for baseline comparisons.
+Stage 2 in `--embedding_mode joint` loads both product images and product text.
+The GGUF backend requires the matching vision projector and a multimodal server.
+`--embedding_mode text` is an optional text-only comparison without a projector.
 
 Use a fresh embedding output directory. Each `.npz` stores `item_id`,
 `parent_asin`, `embedding`, `embedding_mode`, `image_used` (stage 2 only),
 `summary_image_used` (stage 1) and `canonical_summary_item_id`.
-Identical summary texts share an embedding request within a run.
+Only text-mode runs share an embedding request for identical summary texts;
+joint runs must also account for the product image.
 
-For externally verified same-product variants only, optionally supply
+For text-only comparison runs with externally verified same-product variants,
+optionally supply
 `--verified_product_map verified_products.json`, e.g. `{"17": "3", "3": "3"}`.
 Item 17 uses item 3's description and cached vector while keeping its own item ID
 and parent ASIN. Both summaries must exist. The map must point directly to the
@@ -128,7 +141,8 @@ A real one-product smoke run on 2026-10-05 produced
 `output/scene_invariant_smoke/vectors/items_0000000_0000001.npz`.
 The vector has shape `(1, 4096)`, finite values and unit norm. Its flags are
 `summary_image_used=true`, `image_used=false`, `embedding_mode=text`.
-This verifies local inference plumbing, not cross-merchant retrieval gains.
+This historical text-only smoke run verifies that path's local inference
+plumbing, not joint image-text inference or cross-merchant retrieval gains.
 
 ### Alternative processed-item JSON workflow
 
@@ -162,8 +176,9 @@ The local Ollama model above is an Instruct model. It cannot replace the
 separate Qwen3-VL-Embedding checkpoint required by the next command.
 
 Embed each validated v2 summary as text with the official Qwen3-VL-Embedding
-implementation. Put its repository root on `PYTHONPATH`. This entry point also
-defaults to text embeddings; add `--embedding_mode joint` only for comparisons.
+implementation together with the product images. Put its repository root on
+`PYTHONPATH`. Explicitly set `--embedding_mode joint`; the script's existing
+text default is not the intended multimodal method.
 The output remains aligned to numeric item IDs. Use a fresh `--plm_name` to avoid
 overwriting previous vectors.
 
@@ -171,9 +186,10 @@ overwriting previous vectors.
 python rq/text2emb/amazon_summary_vl2emb.py \
   --dataset Office_Products \
   --root data/Amazon23/Office_Products \
-  --plm_name qwen-attributes-text \
+  --plm_name qwen-attributes-joint \
   --plm_checkpoint /models/Qwen3-VL-Embedding-8B \
-  --summary_path output/Office_Products.attributes-v2.jsonl
+  --summary_path output/Office_Products.attributes-v2.jsonl \
+  --embedding_mode joint
 ```
 
 For the locally downloaded Q4_K_M GGUF, start the installed server with
