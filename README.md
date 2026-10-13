@@ -15,6 +15,10 @@ Scaling Generative Recommendation**
 
 **MiniOneRec** is the first fully open-source **generative recommendation** framework, which provides an end-to-end workflow spanning **SID construction**, **supervised fine-tuning (SFT)**, and recommendation-oriented **reinforcement learning (RL)**. 
 
+An experimental extension for structured multimodal summaries, collaborative
+embedding alignment, RFSQ tokenization, and prefix-aware SID CPT is documented
+in [SID_CPT_PIPELINE.md](SID_CPT_PIPELINE.md).
+
 ---
 
 ## 📢 Announcement

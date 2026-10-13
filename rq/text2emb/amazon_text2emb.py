@@ -18,17 +18,36 @@ def load_data(args):
     item2feature = load_json(item2feature_path)
     return item2feature
 
-def generate_text(item2feature, features):
+def load_summary_text(summary_path):
+    """Load successful records produced by generate_structured_summaries.py."""
+    if not summary_path:
+        return {}
+    summaries = {}
+    with open(summary_path, "r", encoding="utf-8") as stream:
+        for line in stream:
+            record = json.loads(line)
+            if record.get("summary_text"):
+                summaries[str(record["item_id"])] = record["summary_text"]
+    return summaries
+
+
+def generate_text(item2feature, features, summary_text=None, require_summary=False):
+    summary_text = summary_text or {}
     item_text_list = []
     for item in item2feature:
         data = item2feature[item]
-        text = []
-        for meta_key in features:
-            if meta_key in data:
-                meta_value = clean_text(data[meta_key])
-                cleaned = meta_value.strip()
-                if cleaned != "":
-                    text.append(cleaned)
+        if str(item) in summary_text:
+            text = [summary_text[str(item)]]
+        else:
+            if require_summary:
+                raise ValueError(f"Missing structured summary for item {item}")
+            text = []
+            for meta_key in features:
+                if meta_key in data:
+                    meta_value = clean_text(data[meta_key])
+                    cleaned = meta_value.strip()
+                    if cleaned != "":
+                        text.append(cleaned)
 
         if len(text) == 0:
             text = ["unknown item"]
@@ -46,7 +65,13 @@ def preprocess_text(args):
     print('Process text data: ')
     print('Dataset: ', args.dataset)
     item2feature = load_data(args)
-    item_text_list = generate_text(item2feature, ['title', 'description'])
+    summaries = load_summary_text(args.summary_path)
+    item_text_list = generate_text(
+        item2feature,
+        ['title', 'description'],
+        summary_text=summaries,
+        require_summary=args.require_summary,
+    )
     return item_text_list
 
 def generate_item_embedding(args, item_text_list, tokenizer, model, accelerator, word_drop_ratio=-1):
@@ -165,6 +190,8 @@ def parse_args():
     parser.add_argument('--plm_checkpoint', type=str, default='xxx', help='Qwen model path')
     parser.add_argument('--max_sent_len', type=int, default=2048)
     parser.add_argument('--word_drop_ratio', type=float, default=-1, help='word drop ratio')
+    parser.add_argument('--summary_path', type=str, default='', help='JSONL structured summaries')
+    parser.add_argument('--require_summary', action='store_true', help='fail if any item has no valid summary')
     return parser.parse_args()
 
 if __name__ == '__main__':

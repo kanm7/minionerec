@@ -1,0 +1,19 @@
+data/Amazon23/raw/*.jsonl.gz
+data/Amazon23/raw/*.jsonl.gz.part
+data/Amazon23/Office_Products/*.item.jsonl
+data/Amazon23/Office_Products/*.item2id
+data/Amazon23/Office_Products/*.sqlite
+data/Amazon23/Office_Products_top3000/images/
+
+# Local datasets, generated artifacts and Python caches
+data/Amazon23/
+output/
+tmp/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.venv/
+.env
+.env.*
+*.gguf
+*.safetensors

@@ -1,5 +1,6 @@
 import argparse
 import collections
+import gzip
 import json
 import os
 import re
@@ -54,7 +55,8 @@ def load_reviews_amazon23(reviews_file):
     reviews = []
     print(f"Loading Amazon23 reviews from: {reviews_file}")
 
-    with open(reviews_file, "r", encoding="utf-8") as f:
+    opener = gzip.open if str(reviews_file).endswith(".gz") else open
+    with opener(reviews_file, "rt", encoding="utf-8") as f:
         for line in tqdm(f, desc="Reading reviews"):
             try:
                 r = json.loads(line.strip())
@@ -102,7 +104,8 @@ def load_metadata_amazon23(metadata_file):
     asin2meta = {}
     asin2title = {}
 
-    with open(metadata_file, "r", encoding="utf-8") as f:
+    opener = gzip.open if str(metadata_file).endswith(".gz") else open
+    with opener(metadata_file, "rt", encoding="utf-8") as f:
         for line in tqdm(f, desc="Reading metadata"):
             try:
                 m = json.loads(line.strip())
@@ -433,14 +436,15 @@ def build_item_features_amazon23(asin2meta, item2index):
         image_urls = []
         for img in images:
             if isinstance(img, dict):
-                if "hi_res" in img:
+                if img.get("hi_res"):
                     image_urls.append(img["hi_res"])
-                elif "large" in img:
+                elif img.get("large"):
                     image_urls.append(img["large"])
-                elif "thumb" in img:
+                elif img.get("thumb"):
                     image_urls.append(img["thumb"])
 
         item2feature[idx] = {
+            "parent_asin": asin,
             "title": title,
             "description": desc,
             "features": feats,
