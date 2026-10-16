@@ -1,4 +1,4 @@
-"""Embed canonical product descriptions as text; joint mode is opt-in for comparison.
+"""Embed canonical descriptions together with product images (joint by default).
 
 Requires the official Qwen3-VL-Embedding repository on PYTHONPATH. The output
 uses the same item ordering and filename convention as amazon_text2emb.py.
@@ -99,7 +99,7 @@ def gguf_embed(server_url, entries, media_marker):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--embedding_mode", choices=("text", "joint"), default="text")
+    parser.add_argument("--embedding_mode", choices=("text", "joint"), default="joint")
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--root", required=True)
     parser.add_argument("--summary_path", required=True)

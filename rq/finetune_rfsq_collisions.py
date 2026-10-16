@@ -45,6 +45,7 @@ def main():
     parser.add_argument("--pair_batch_size", type=int, default=128)
     parser.add_argument("--mine_every", type=int, default=20)
     parser.add_argument("--eval_every", type=int, default=25)
+    parser.add_argument("--early_stop_patience", type=int, default=0, help="Evaluations without collision or MSE improvement; 0 disables")
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -76,6 +77,8 @@ def main():
         bn=train_args.bn,
         loss_type=train_args.loss_type,
         latent_activation=getattr(train_args, "latent_activation", "tanh"),
+        scalar_bound=getattr(train_args, "scalar_bound", "legacy") == "clamp",
+        input_clamp=getattr(train_args, "quantizer_input_clamp", False),
     ).to(args.device)
     model.load_state_dict(checkpoint["state_dict"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -84,6 +87,20 @@ def main():
     best_collision_rate = float("inf")
     history = []
     pair_indices = torch.empty((0, 2), dtype=torch.long, device=args.device)
+    # Include the starting model so fine-tuning never selects a worse raw
+    # collision rate simply because all evaluated updates were worse.
+    model.eval()
+    with torch.no_grad():
+        initial_indices=model.get_indices(values)
+        best_collision_rate=(len(values)-torch.unique(initial_indices,dim=0).shape[0])/len(values)
+    torch.save(dict(args=train_args,state_dict=model.state_dict(),epoch=0,
+                    best_collision_rate=best_collision_rate,fine_tune_args=vars(args)),
+               output_dir/'best_collision_model.pth')
+    print(json.dumps(dict(epoch=0,collision_rate=best_collision_rate,phase='starting_checkpoint')),flush=True)
+    stale = 0
+    with torch.no_grad():
+        initial_reconstruction,_,_ = model(values)
+        best_reconstruction = F.mse_loss(initial_reconstruction, values).item()
 
     for epoch in range(args.epochs):
         if epoch % args.mine_every == 0:
@@ -133,6 +150,9 @@ def main():
                 "mined_pairs": len(pair_indices),
             }
             history.append(record)
+            improved = collision_rate < best_collision_rate or reconstruction_mse < best_reconstruction - 1e-5
+            best_reconstruction = min(best_reconstruction, reconstruction_mse)
+            stale = 0 if improved else stale + 1
             print(json.dumps(record), flush=True)
             if collision_rate < best_collision_rate:
                 best_collision_rate = collision_rate
@@ -147,6 +167,9 @@ def main():
                     output_dir / "best_collision_model.pth",
                 )
             model.train()
+            if args.early_stop_patience and stale >= args.early_stop_patience:
+                print(json.dumps(dict(early_stop=True,epoch=epoch+1,stale_evaluations=stale)),flush=True)
+                break
 
     (output_dir / "metrics.json").write_text(
         json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"

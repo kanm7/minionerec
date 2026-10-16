@@ -17,3 +17,10 @@ __pycache__/
 .env.*
 *.gguf
 *.safetensors
+
+# Local inference weights, caches and compiled third-party server
+models/
+tools/llama.cpp/
+
+# macOS Finder metadata
+.DS_Store

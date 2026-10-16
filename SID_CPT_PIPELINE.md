@@ -13,7 +13,122 @@ artifacts, so the existing `convert_dataset.py`, `sft.py`, `rl.py` and
 
 ## 1. Product image-text joint embeddings
 
+### Current SID dataset: chronological ~5,000-product prefix
+
+The current SID input dataset is **Office_Products_chrono5000**, not the
+historical popularity-selected top3000 benchmark. Starting at
+`2018-10-01T00:00:00+08:00`, count distinct `parent_asin` values in raw reviews
+ordered by their original **millisecond** timestamps. The time at which the
+5,000th distinct product first appears is the cutoff. Retain **all** reviews
+between start and cutoff inclusive, including all cutoff-time ties, duplicate
+reviews, image-less products, missing metadata, and singleton users. Do not
+select by popularity, apply user/item 5-core, or add interactions after cutoff.
+
+```bash
+python data/build_amazon23_chronological_subset.py \
+  --reviews_file data/Amazon23/raw/Office_Products.jsonl.gz \
+  --source_catalog data/Amazon23/Office_Products/Office_Products.item.jsonl \
+  --output_dir data/Amazon23/Office_Products_chrono5000 \
+  --start_time 2018-10-01T00:00:00 --timezone Asia/Shanghai --items 5000
+python data/download_amazon23_product_images.py \
+  --catalog data/Amazon23/Office_Products_chrono5000/Office_Products.item.jsonl \
+  --output_catalog data/Amazon23/Office_Products_chrono5000/Office_Products.local.item.jsonl \
+  --image_dir data/Amazon23/Office_Products_chrono5000/images \
+  --allow_missing_images --allow_unavailable_images --workers 32
+```
+
+The output directory must be new. Item IDs follow first appearance (ties by
+ASIN). Stable interaction ordering is timestamp then original source line;
+same-time records are all retained. Global 80/10/10 time splits assign each
+boundary timestamp entirely to the earlier split. Full user histories are in
+`.inter.json` and `.user_histories.jsonl`; `.samples.jsonl` and `.train/valid/test.inter`
+retain **every** interaction, including first interactions with an empty
+history. `--max_history 0` preserves full prior history. No later interactions
+are introduced into sample histories. Keep singleton/empty-history counts
+visible; this dataset may have many cold-start users.
+
+This dataset intentionally uses **mixed embedding inputs**:
+
+- readable product image: image + structured attributes, `embedding_mode=joint`,
+  `image_used=true`;
+- no usable image: attributes from metadata using the same Instruct model, then
+  **the same Qwen3-VL-Embedding-8B** encoder in text-only mode,
+  `embedding_mode=text`, `image_used=false`;
+- no usable product text: record an exception and retain its catalog ID and
+  interactions. Never replace it with a later product or fabricate a vector.
+
+Missing image URLs and unavailable/download-failed images are separate recorded
+categories. `--allow_unavailable_images` explicitly accepts those failures as
+text-only inputs and preserves their error details. Without that flag, download
+failures fail preparation. An unreadable image declared available still causes
+attribute/embedding failure, never a silent text fallback. Text usability is
+assessed from product title/description/features/details, not category/brand
+alone. Metadata/image availability does not affect the cutoff.
+
+After starting an Ollama service with the Instruct Q4_K_M model, run the
+two-stage resumable pipeline (replace paths with real local paths):
+
+```bash
+python data/run_amazon23_chronological_embeddings.py \
+  --catalog data/Amazon23/Office_Products_chrono5000/Office_Products.local.item.jsonl \
+  --output_dir output/amazon23_chrono5000 \
+  --ollama_model benchmark-qwen3-vl:8b-instruct-q4_K_M \
+  --ollama_url http://127.0.0.1:11435 --num_ctx 8192 --workers 1 \
+  --model models/Qwen3-VL-Embedding-8B/Qwen3-VL-Embedding-8B-Q4_K_M.gguf \
+  --mmproj models/Qwen3-VL-Embedding-8B/mmproj-Qwen3-VL-Embedding-8B-f16.gguf \
+  --llama_server tools/llama.cpp/build/bin/llama-server \
+  --matrix_output data/Amazon23/Office_Products_chrono5000/Office_Products.emb-qwen-attributes-mixed-td.npy
+```
+
+Only one stage's model is loaded at a time. Successful v2 attributes resume by
+ID; the orchestrator verifies their ASINs before resuming, retries failures,
+and preserves raw attempts separately from final validated attributes. It starts
+the embedding server only after attributes are valid and Ollama is unloaded.
+The per-item `embedding_mode` array in mixed NPZs reports the actual input, not
+just the requested dataset-level mode. Export checks coverage, ASINs, image
+provenance, shape, finite/nonzero vectors, and saves a `.npy.item_ids.npy`
+row-to-original-ID sidecar. RFSQ export honors those IDs; SID input loading
+rejects non-finite vectors rather than converting them to zero placeholders.
+Exceptions do not remove interactions. If any product has no valid vector,
+complete SID coverage is unresolved and must be handled explicitly downstream.
+
+Once the full pipeline reports `status=complete`, the SID stage must use the
+new matrix and the new interaction root, not the top3000/full-k-core artifacts.
+For example, the later RFSQ run would use:
+
+```bash
+python rq/rqfsq.py \
+  --data_path data/Amazon23/Office_Products_chrono5000/Office_Products.emb-qwen-attributes-mixed-td.npy \
+  --ckpt_dir output/Office_Products_chrono5000-rfsq
+python rq/generate_rfsq_indices.py \
+  --checkpoint output/Office_Products_chrono5000-rfsq/<run>/best_collision_model.pth \
+  --output_file data/Amazon23/Office_Products_chrono5000/Office_Products.index.json \
+  --repair_collisions
+```
+
+These are subsequent training commands, not part of embedding/sequence
+preparation. After SID generation, use
+`--data_dir data/Amazon23/Office_Products_chrono5000` in `convert_dataset.py`
+and leave `--keep_longest_only` disabled to retain all prepared samples. If
+collaborative alignment is later run, use the same new `.train.inter` and
+verify complete dense vector coverage first; it must not consume old histories
+or a compact matrix with missing item IDs as if it were dense.
+
+This run's cutoff is `2018-10-03T06:26:21.072+08:00`, yielding 5,000 products,
+5,576 users and 6,465 interactions (train/valid/test 5,172/647/646). There are
+4,978 downloaded usable product images, 21 products without image URLs and one
+product whose original 26 image URLs all fail. Thus **4,978 joint + 22 text-only**
+inputs are expected; no product lacks usable text metadata. Final actual
+counts, exceptions, validation and commands are saved in
+`output/amazon23_chrono5000/REPORT.md` after the pipeline completes. Do not label
+this representation as an all-joint embedding dataset or claim recommendation
+quality from successful vector generation.
+
 ### Two-stage multimodal product representation
+
+The following image-complete top3000 workflow is retained for reproducing the
+historical strict-joint benchmark. The current chronological dataset uses the
+explicit mixed policy above.
 
 Stage 1 uses the existing Qwen3-VL Instruct model to extract target-product
 attributes from metadata and product images. The prompt excludes people, hands,
@@ -24,9 +139,10 @@ image-only embedding or text-only embedding. Attribute normalization aims to
 focus the textual description on the product; it does not prove that the joint
 encoder ignores visual backgrounds or shooting conditions.
 
-The current scripts still default to `--embedding_mode text`. Explicitly pass
-`--embedding_mode joint` for the intended method. Text-only runs are comparison
-experiments and must be reported separately from joint runs.
+The catalog embedding CLI defaults to `mixed`; the processed-item alternative
+defaults to `joint`. Explicitly pass `--embedding_mode joint` for this historical
+image-complete benchmark, or `--embedding_mode mixed` for the current chronological dataset. Separate
+text-only comparison runs must not be reported as all-joint experiments.
 
 The v2 schema includes product type, brand, model, compatible model, function,
 material, color, pattern, specifications, structural features and intended use.
@@ -175,10 +291,9 @@ responses are recorded with an `error` field and retried on restart.
 The local Ollama model above is an Instruct model. It cannot replace the
 separate Qwen3-VL-Embedding checkpoint required by the next command.
 
-Embed each validated v2 summary as text with the official Qwen3-VL-Embedding
-implementation together with the product images. Put its repository root on
-`PYTHONPATH`. Explicitly set `--embedding_mode joint`; the script's existing
-text default is not the intended multimodal method.
+Embed each validated v2 summary jointly with its product image using the official
+Qwen3-VL-Embedding implementation. Put its repository root on
+`PYTHONPATH`. Explicitly set `--embedding_mode joint` (also its default).
 The output remains aligned to numeric item IDs. Use a fresh `--plm_name` to avoid
 overwriting previous vectors.
 
@@ -235,6 +350,69 @@ sampled as negatives.
 
 ## 3. RFSQ tokenizer
 
+### Learning-rate strategy ablation
+
+```bash
+.venv/bin/python data/run_amazon23_rfsq_lr_trial.py --detach
+```
+
+This keeps the Office chrono5000 embeddings, sequences, quantizer and network
+fixed, and tests `lr=0.0003` with linear decay after 50 warmup epochs, compared
+with the original `lr=0.001` constant schedule. It changes the complete LR
+strategy, so it does not isolate the two components individually. Runs 5000
+epochs and compares raw collisions, reconstruction and non-singleton purity.
+Experimental SIDs remain under the output directory; no canonical SID is
+replaced. The generic benchmark exposes `--lr`, `--lr_scheduler_type` and
+`--no_publish_index`. Representation and MPS benchmark pipelines share an
+exclusive local GPU lock; other model phases wait while image downloads may
+continue. Progress and final comparison are under
+`output/Office_Products_chrono5000-rfsq/lr-linear-0003`.
+
+### Industrial & Scientific official 5-core trial
+
+The current follow-up trial uses full official deduplicated Industrial &
+Scientific 5-core data, with the official absolute-timestamp train/valid/test
+files. It retains 25,848 products, 50,985 users and 412,947 interactions
+(297,922 / 44,128 / 70,897). All source pairs are unique, every user/product
+has at least five interactions, and every official history matches the
+preceding full user history. Histories include prior evaluation events as in
+the official event-by-event protocol, never future events.
+
+Preparation: `data/prepare_amazon23_official_5core.py`; output:
+`data/Amazon23/Industrial_and_Scientific_5core`.
+Start the complete local trial with:
+
+```bash
+.venv/bin/python data/run_amazon23_industrial_trial.py --detach
+```
+
+The existing Office experiment remains intact. Progress is recorded in
+`output/amazon23_industrial_5core/trial.status.json`, with representation
+progress under `representations/`. The new trial keeps the same models,
+mixed image/text policy and RFSQ configuration to provide a baseline
+comparison. Exceptions remain in histories; incomplete vector coverage stops
+SID training. It does not run collaborative alignment or recommender training.
+
+The chrono5000 end-to-end run uses the prepared mixed-modal matrix and the
+unchanged chronological sequence samples:
+
+```bash
+.venv/bin/python data/run_amazon23_rfsq_benchmark.py --epochs 5000 --device mps
+```
+
+This trains with `tanh`, scalar-level bounds, scale conditioning and three
+2048-cell stages. It records commands/timings, exports both raw and repaired
+SIDs, audits coverage and reconstruction, reports training-only popularity
+and category purity, and joins the existing samples to SID sequences. Output
+is a fresh `output/Office_Products_chrono5000-rfsq/benchmark-*` directory.
+The canonical `Office_Products.index.json` is published only after coverage,
+token-range and uniqueness checks; `.index.raw.json` retains raw assignments.
+The best-collision checkpoint is selected by raw excess-assignment collision
+rate, breaking ties by lower training reconstruction loss. The best-loss
+checkpoint has a separate report, so uniqueness is not treated as the sole
+representation-quality measure. No collaborative alignment or recommender
+training is included.
+
 `rq/models/rfsq.py` follows *Robust Residual Finite Scalar Quantization for
 Neural Compression* (arXiv:2508.15860). Every stage uses a fixed implicit
 Cartesian-product codebook. `scale` conditioning is the default because its
@@ -250,10 +428,48 @@ python rq/rqfsq.py \
   --batch_size 2048
 ```
 
+RFSQ has **no learned centroid table**. Each residual stage has a fixed implicit
+Cartesian product of scalar levels. Its nominal discrete capacity is
+`product(levels_per_stage)`: `4,4,4,2,2,2,2,2` gives 2,048 cells. Usage metrics
+measure assignments to those implicit cells, rather than learned vectors.
+
+The quantizer exposes `benchmark(indices, item_ids, ...)`; RFSQ training calls
+it at each `--eval_step` and at the final epoch. It scans the complete embedding
+dataset in fixed order, preserving original item IDs even when the training
+loader shuffles or drops its tail. Raw per-stage/prefix/full-SID reports are
+saved to `<checkpoint_run>/sid_benchmark/epoch_XXXXXX.json`, `latest.json` and
+`history.jsonl`. Occupancy/exclusivity are also logged. Metrics do not modify
+the loss or checkpoint-selection objective.
+
+To include category purity and training-popularity concentration:
+
+```bash
+python rq/rqfsq.py \
+  --data_path data/Amazon23/Office_Products_chrono5000/Office_Products.emb-qwen-attributes-mixed-td.npy \
+  --ckpt_dir output/Office_Products_chrono5000-rfsq \
+  --metrics_item_file data/Amazon23/Office_Products_chrono5000/Office_Products.item.json \
+  --metrics_interaction_file data/Amazon23/Office_Products_chrono5000/Office_Products.interactions.jsonl \
+  --metrics_category_level leaf \
+  --metrics_hot_cluster_percent 1 --metrics_hot_cluster_multiplier 5
+```
+
+New training defaults to `--scalar_bound clamp`: each rounded scalar level ID
+is saturated to `[0, L_i-1]` before radix packing, so every stage remains a
+finite Cartesian-product space even with learnable residual scaling. The
+straight-through gradient is retained. This is an explicit correction to the
+previous unbounded quantizer, not a post-hoc collision repair. Old checkpoints
+without this setting retain their original behavior on export; use
+`--scalar_bound legacy` only to reproduce the old unbounded implementation.
+Diagnostics still report out-of-range IDs in legacy assignments rather than
+silently fixing them. Occupancy means implicit-cell usage, not utilization of
+a learned centroid table.
+
 The default is three stages of `4,4,4,2,2,2,2,2`: eight scalar dimensions and
 2048 codes per stage. Input embeddings are standardized per dimension, and the
-encoder output has no `tanh` activation. Use `--no-standardize` or
-`--latent_activation tanh` for ablations. Standardization is repeated when
+encoder output defaults to `tanh` to bound the first-stage input. The previous
+unbounded `none` setting collapsed on the chrono5000 training run; it remains
+available as an explicit ablation. Use `--no-standardize` to disable input
+standardization. Standardization is repeated when
 indices are exported from the checkpoint. Generate three-token
 SIDs from the best collision checkpoint:
 
@@ -273,15 +489,54 @@ Tokenizer diagnostics:
 
 ```bash
 python rq/sid_metrics.py \
-  --index_file data/Amazon23/Office_Products/Office_Products.index.json \
+  --index_file data/Amazon23/Office_Products_chrono5000/Office_Products.index.json \
   --codebook_sizes 2048 2048 2048 \
-  --item_file data/Amazon23/Office_Products/Office_Products.item.json \
-  --output_file output/Office_Products.sid-metrics.json
+  --item_file data/Amazon23/Office_Products_chrono5000/Office_Products.item.json \
+  --interaction_file data/Amazon23/Office_Products_chrono5000/Office_Products.interactions.jsonl \
+  --category_level leaf --hot_cluster_percent 1 --hot_cluster_multiplier 5 \
+  --sid_variant repaired \
+  --raw_index_file data/Amazon23/Office_Products_chrono5000/Office_Products.index.raw.json \
+  --output_file output/Office_Products_chrono5000.sid-metrics.json
 ```
 
-The report includes full-SID uniqueness/collision, per-layer occupancy and
-entropy, high-frequency code share, prefix cluster sizes and optional category
-purity. Downstream Recall/NDCG must still decide the final tokenizer choice.
+The report computes metrics for **each layer, each prefix depth, and full SIDs**:
+
+| Metric | Definition |
+|---|---|
+| `singleton_rate` | Single-item codes/clusters divided by used codes/clusters |
+| `exclusive_item_rate` | Items assigned an exclusive code/cluster divided by all items |
+| `occupancy_rate` | Used codes divided by declared capacity; prefix capacity is the product of preceding layer capacities |
+| `collision_rate` | Excess assignments `(items - distinct full SIDs) / items` |
+| `collision_item_rate` | All items in colliding clusters divided by items |
+| `hot_clusters_above_mean.cluster_rate` | Used clusters whose summed training interactions reach at least `--hot_cluster_multiplier` times the mean used-cluster interaction mass, divided by used clusters |
+| `hot_clusters.popularity_share` | Training interaction share of the hottest `--hot_cluster_percent` percent of used clusters; also reports their item share |
+| `purity.item_weighted_purity` | Sum of majority-label counts per cluster divided by labeled items |
+| `purity.non_singleton_cluster_item_weighted_purity` | The same calculation restricted to original clusters containing multiple items |
+
+Both observed-code normalized entropy and capacity-normalized entropy are
+reported, together with effective code count, maximum/mean cluster size,
+label coverage and macro purity. Missing labels are excluded from purity and
+reported through coverage; missing heat data does not produce a fabricated
+popularity statistic. Zero total training heat produces null heat fractions.
+Use the **raw interaction JSONL**, not sliding-window histories, to count each
+training record once and avoid repeated-history counts or test leakage.
+
+Category purity defaults to the leaf (last) category rather than the broad
+root; for multiple taxonomy paths it uses the first path. A dotted field such
+as `--category_field summary.product_type` can evaluate attributes JSONL, but
+model-generated product types are proxy labels, not independent ground truth.
+Singleton clusters have purity 1 by construction, especially after collision
+repair; inspect non-singleton purity and compare raw/repaired metrics. Full-SID
+capacity grows multiplicatively, so low full-space occupancy alone is not an
+indication of poor layer utilization.
+
+`generate_rfsq_indices.py` now automatically saves `.metrics.json` alongside
+its index, using the checkpoint's actual codebook sizes. With
+`--repair_collisions` it also preserves `.raw.json` and includes raw metrics.
+Pass `--item_file` and `--interaction_file` to that command to include purity
+and training heat immediately. Without those files, capacity and exclusivity
+diagnostics still run, while unavailable label/heat metrics are omitted.
+Downstream Recall/NDCG must still decide the final tokenizer choice.
 
 If raw collisions remain, an optional second stage can fine-tune an RFSQ
 checkpoint with a margin loss on pairs of different item vectors that currently

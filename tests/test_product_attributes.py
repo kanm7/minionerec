@@ -65,7 +65,7 @@ class ProductAttributeTests(unittest.TestCase):
             mapping.write_text('{"1": "0"}')
             argv = ["embed", "--catalog", str(catalog), "--summary_path", str(summaries),
                     "--output_dir", str(root / "out"), "--model", str(model),
-                    "--verified_product_map", str(mapping), "--shard_size", "1"]
+                    "--embedding_mode", "text", "--verified_product_map", str(mapping), "--shard_size", "1"]
             with patch("sys.argv", argv), patch.object(catalog_embed.requests, "get") as get, \
                     patch.object(catalog_embed, "gguf_embed", return_value=np.array([[1, 2]], dtype=np.float32)) as embed, \
                     patch.object(catalog_embed, "load_image") as load:

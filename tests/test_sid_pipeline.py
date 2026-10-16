@@ -137,7 +137,17 @@ class RFSQTests(unittest.TestCase):
         quantized, indices = quantizer(values)
         self.assertEqual(tuple(quantized.shape), (2, 2))
         self.assertEqual(indices[0].item(), 2)
-        self.assertTrue(torch.allclose(quantized[1], torch.tensor([5.0 / 3.0, -2.0])))
+        self.assertTrue(torch.allclose(quantized[1], torch.tensor([1.0, -1.0])))
+        self.assertTrue(bool(((indices >= 0) & (indices < quantizer.codebook_size)).all()))
+        self.assertTrue(torch.allclose(quantized, quantizer.indices_to_codes(indices)))
+        quantized.sum().backward()
+        self.assertTrue(torch.equal(values.grad, torch.ones_like(values)))
+
+    def test_legacy_unbounded_fsq_remains_explicitly_available(self):
+        quantizer = FiniteScalarQuantizer([4, 3], scalar_bound=False)
+        values = torch.tensor([[1.5, -2.0]], requires_grad=True)
+        quantized, _ = quantizer(values)
+        self.assertTrue(torch.allclose(quantized[0], torch.tensor([5.0 / 3.0, -2.0])))
         quantized.sum().backward()
         self.assertTrue(torch.equal(values.grad, torch.ones_like(values)))
 

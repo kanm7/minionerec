@@ -18,8 +18,10 @@ from .layers import MLPLayers
 
 
 class FiniteScalarQuantizer(nn.Module):
-    def __init__(self, levels: Sequence[int]):
+    def __init__(self, levels: Sequence[int], scalar_bound: bool = True, input_clamp: bool = False):
         super().__init__()
+        self.scalar_bound = scalar_bound
+        self.input_clamp = input_clamp
         if not levels or any(level < 2 for level in levels):
             raise ValueError("Every FSQ dimension must have at least two levels")
         self.register_buffer("levels", torch.tensor(list(levels), dtype=torch.long))
@@ -37,9 +39,14 @@ class FiniteScalarQuantizer(nn.Module):
             raise ValueError(
                 f"Expected latent dim {len(self.levels)}, got {values.shape[-1]}"
             )
+        if self.input_clamp:
+            values = values.clamp(-1.0, 1.0)
         levels = self.levels.to(device=values.device)
-        # No input clipping: callers must ensure the range for finite code IDs.
         scalar_indices = torch.round((values + 1.0) * (levels - 1) / 2.0).long()
+        # Saturate each coordinate before radix packing. Clamping only the
+        # packed ID would allow invalid coordinates to alias valid cells.
+        if self.scalar_bound:
+            scalar_indices = torch.minimum(scalar_indices.clamp_min(0), levels - 1)
         quantized = scalar_indices.to(values.dtype) * 2.0 / (levels - 1) - 1.0
         quantized_ste = values + (quantized - values).detach()
         code_indices = (scalar_indices * self.strides.to(values.device)).sum(dim=-1)
@@ -62,6 +69,8 @@ class RobustResidualFSQ(nn.Module):
         levels_per_stage: Sequence[Sequence[int]],
         conditioning: str = "scale",
         eps: float = 1e-5,
+        scalar_bound: bool = True,
+        input_clamp: bool = False,
     ):
         super().__init__()
         if not levels_per_stage:
@@ -73,9 +82,11 @@ class RobustResidualFSQ(nn.Module):
             raise ValueError("conditioning must be one of: none, scale, layernorm")
         self.levels_per_stage = [list(levels) for levels in levels_per_stage]
         self.conditioning = conditioning
+        self.scalar_bound = scalar_bound
+        self.input_clamp = input_clamp
         self.eps = eps
         self.quantizers = nn.ModuleList(
-            [FiniteScalarQuantizer(levels) for levels in levels_per_stage]
+            [FiniteScalarQuantizer(levels, scalar_bound, input_clamp) for levels in levels_per_stage]
         )
         # softplus(0.5413) is approximately 1.0. Stage zero is intentionally
         # unconditioned to match Algorithm 1 in the paper.
@@ -84,6 +95,19 @@ class RobustResidualFSQ(nn.Module):
     @property
     def codebook_sizes(self) -> List[int]:
         return [quantizer.codebook_size for quantizer in self.quantizers]
+
+    def benchmark(self, indices, item_ids=None, **kwargs):
+        """Measure assignments to implicit cells, not learned centroid vectors."""
+        try:
+            from ..rfsq_metrics import rfsq_benchmark
+        except ImportError:
+            from rfsq_metrics import rfsq_benchmark
+        if isinstance(indices, torch.Tensor): indices = indices.detach().cpu().numpy()
+        report = rfsq_benchmark(indices, self.levels_per_stage, item_ids, **kwargs)
+        report["scalar_bound"] = "clamp" if self.scalar_bound else "legacy"
+        report["conditioning"] = self.conditioning
+        report["input_clamp"] = self.input_clamp
+        return report
 
     def forward(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         residual = values
@@ -125,6 +149,8 @@ class RFSQVAE(nn.Module):
         bn: bool = False,
         loss_type: str = "mse",
         latent_activation: str = "tanh",
+        scalar_bound: bool = True,
+        input_clamp: bool = False,
     ):
         super().__init__()
         self.in_dim = in_dim
@@ -137,11 +163,13 @@ class RFSQVAE(nn.Module):
         if latent_activation not in {"tanh", "none"}:
             raise ValueError("latent_activation must be tanh or none")
         self.latent_activation = latent_activation
+        self.scalar_bound = scalar_bound
+        self.input_clamp = input_clamp
         latent_dim = len(self.levels_per_stage[0])
         encoder_dims = [in_dim] + self.layers + [latent_dim]
         self.encoder = MLPLayers(layers=encoder_dims, dropout=dropout_prob, bn=bn)
         self.quantizer = RobustResidualFSQ(
-            self.levels_per_stage, conditioning=conditioning
+            self.levels_per_stage, conditioning=conditioning, scalar_bound=scalar_bound, input_clamp=input_clamp
         )
         self.decoder = MLPLayers(layers=encoder_dims[::-1], dropout=dropout_prob, bn=bn)
 

@@ -49,6 +49,10 @@ def main():
     parser.add_argument("--timeout", type=float, default=15)
     parser.add_argument("--attempts", type=int, default=2)
     parser.add_argument("--limit", type=int, default=-1)
+    parser.add_argument("--allow_missing_images", action="store_true",
+                        help="Retain products without image URLs; download failures still fail")
+    parser.add_argument("--allow_unavailable_images", action="store_true",
+                        help="Explicitly retain failed image downloads as text-only inputs, recording errors")
     args = parser.parse_args()
     items = [json.loads(line) for line in args.catalog.open(encoding="utf-8")]
     if args.limit > 0:
@@ -71,6 +75,11 @@ def main():
             local = dict(item)
             local["image_urls"] = item.get("images", [])
             local["images"] = [path] if path else []
+            local["image_status"] = ("available" if path else
+                                     ("no_usable_image" if args.allow_unavailable_images else "download_failed")
+                                     if item.get("images") else "no_image_urls")
+            if error and item.get("images"):
+                local["image_error"] = error
             if url:
                 local["downloaded_image_url"] = url
             output.write(json.dumps(local, ensure_ascii=False) + "\n")
@@ -79,9 +88,11 @@ def main():
                                  "error": error})
     failure_path = args.output_catalog.with_suffix(".failures.json")
     failure_path.write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
+    fatal = [row for row in failures if not args.allow_unavailable_images and
+             (not args.allow_missing_images or results[row["item_id"]][2] != "no image URLs")]
     print(f"Downloaded/verified {len(items) - len(failures)}/{len(items)}; "
           f"catalog={args.output_catalog}; failures={failure_path}")
-    if failures:
+    if fatal:
         raise SystemExit(1)
 
 

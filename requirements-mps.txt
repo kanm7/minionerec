@@ -1,0 +1,17 @@
+# Direct dependencies from the validated Apple MPS experiment environment.
+# Python 3.14 / Apple Silicon; original requirements.txt remains the CUDA workflow.
+torch==2.14.1
+transformers==5.19.0
+numpy==2.5.4
+pyarrow==26.0.0
+pandas==3.0.6
+Pillow==12.3.0
+requests==2.34.2
+tqdm==4.70.1
+PyYAML==6.0.3
+matplotlib==3.11.2
+huggingface_hub==2.2.0
+safetensors==0.8.0
+fire==0.7.1
+openai==3.31.0
+aiohttp==3.14.5

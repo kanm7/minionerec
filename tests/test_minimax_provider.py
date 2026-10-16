@@ -8,19 +8,8 @@ import types
 import unittest
 from unittest.mock import patch, MagicMock
 
-# Mock heavy dependencies that may not be installed in test environment
-_mock_modules = {}
-for mod_name in [
-    'torch', 'transformers', 'gensim', 'accelerate', 'accelerate.utils',
-]:
-    if mod_name not in sys.modules:
-        _mock_modules[mod_name] = sys.modules[mod_name] = MagicMock()
-
-# Add project root so we can import rq/text2emb/utils
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'rq', 'text2emb'))
-
-import utils as text2emb_utils
-
+# Import the namespaced module without leaking mocks into other test modules.
+from rq.text2emb import utils as text2emb_utils
 
 class TestGetResBatchDispatch(unittest.TestCase):
     """Test that get_res_batch correctly dispatches to the right provider."""
@@ -77,11 +66,13 @@ class TestMiniMaxBatch(unittest.TestCase):
 
     @patch.object(text2emb_utils.requests, 'post')
     def test_multiple_prompts(self, mock_post):
-        mock_post.side_effect = [
-            self._make_response("Response 1"),
-            self._make_response("Response 2"),
-            self._make_response("Response 3"),
-        ]
+        # Worker arrival order is nondeterministic; bind each response to its
+        # request prompt so this actually tests output ordering under concurrency.
+        responses = {"p1": "Response 1", "p2": "Response 2", "p3": "Response 3"}
+        def respond(*args, **kwargs):
+            prompt = kwargs["json"]["messages"][0]["content"]
+            return self._make_response(responses[prompt])
+        mock_post.side_effect = respond
         api_info = {"provider": "minimax", "api_key_list": ["test-key"]}
         results = text2emb_utils.get_minimax_batch(
             "MiniMax-M2.7", ["p1", "p2", "p3"], 100, api_info

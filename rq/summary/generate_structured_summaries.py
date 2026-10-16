@@ -3,8 +3,9 @@
 
 The output is JSONL so a long-running Amazon catalog job can be resumed safely.
 Each line contains ``item_id``, a validated ``summary`` object and a canonical
-``summary_text`` string that is embedded without the original image by
-``amazon23_summary_image_embed.py``.
+``summary_text`` string. The catalog embedding script combines this text with
+the original product image, or uses text-only for explicitly image-less items
+in mixed mode.
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ import io
 import unicodedata
 import json
 import re
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Iterable
 
@@ -189,10 +192,13 @@ class LocalVisionLanguageModel:
 class OllamaTextModel:
     """Use the existing Ollama vision model for product attribute extraction."""
 
-    def __init__(self, model: str, base_url: str, max_new_tokens: int):
+    def __init__(self, model: str, base_url: str, max_new_tokens: int, num_ctx=None, keep_alive=None, strict_schema=False):
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.max_new_tokens = max_new_tokens
+        self.num_ctx = num_ctx
+        self.keep_alive = keep_alive
+        self.strict_schema = strict_schema
 
     def generate(self, product_text: str, images=None) -> str:
         encoded = []
@@ -200,18 +206,35 @@ class OllamaTextModel:
             buffer = io.BytesIO()
             image.save(buffer, format="PNG")
             encoded.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
-        response = requests.post(
-            f"{self.base_url}/api/chat",
-            json={
+        system_prompt = SYSTEM_PROMPT
+        output_format = "json"
+        if self.strict_schema:
+            system_prompt += ("\nThe empty schema illustrates field names, not the answer. Populate known facts "
+                              "from the explicit title/metadata and image; do not copy the blank example.")
+            properties = {key: {"type": "array", "items": {"type": "string"}} if key in LIST_FIELDS
+                          else {"type": "string"} for key in SUMMARY_FIELDS}
+            properties["product_type"]["minLength"] = 1
+            output_format = {"type": "object", "properties": properties,
+                             "required": list(SUMMARY_FIELDS), "additionalProperties": False}
+        payload = {
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"Product:\n{product_text}", "images": encoded},
                 ],
-                "format": "json",
+                "format": output_format,
                 "stream": False,
+                "think": False,
                 "options": {"num_predict": self.max_new_tokens, "temperature": 0},
-            },
+            }
+        if self.num_ctx is not None:
+            payload["options"]["num_ctx"] = self.num_ctx
+        if self.keep_alive is not None:
+            value = str(self.keep_alive)
+            payload["keep_alive"] = int(value) if value.lstrip("-").isdigit() else self.keep_alive
+        response = requests.post(
+            f"{self.base_url}/api/chat",
+            json=payload,
             timeout=600,
         )
         response.raise_for_status()
@@ -268,26 +291,34 @@ def main() -> None:
     parser.add_argument("--max_image_side", type=int, default=768)
     parser.add_argument("--image_timeout", type=float, default=20)
     parser.add_argument("--allow_missing_images", action="store_true")
+    parser.add_argument("--workers", type=int, default=1, help="Concurrent Ollama requests; ordered output")
+    parser.add_argument("--num_ctx", type=int, help="Ollama context size")
+    parser.add_argument("--keep_alive", help="Ollama residency, e.g. -1")
     args = parser.parse_args()
     if min(args.max_images, args.max_image_side, args.max_text_chars) < 1 or args.max_retries < 0:
         parser.error("Image/text sizes must be positive and retries nonnegative")
     if bool(args.model_checkpoint) == bool(args.ollama_model):
         parser.error("Provide exactly one of --model_checkpoint or --ollama_model")
+    if args.workers < 1 or (args.workers > 1 and not args.ollama_model):
+        parser.error("Multiple workers require Ollama; workers must be positive")
+    if args.num_ctx is not None and args.num_ctx < 1:
+        parser.error("--num_ctx must be positive")
 
     item_path = Path(args.item_file)
     output_path = Path(args.output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     completed = read_completed(output_path, args.allow_missing_images)
     if args.ollama_model:
-        model = OllamaTextModel(args.ollama_model, args.ollama_url, args.max_new_tokens)
+        model = OllamaTextModel(args.ollama_model, args.ollama_url, args.max_new_tokens,
+                                args.num_ctx, args.keep_alive)
     else:
         model = LocalVisionLanguageModel(
             args.model_checkpoint, args.device_map, args.max_new_tokens
         )
 
-    with output_path.open("a", encoding="utf-8") as output:
+    def selected_items():
         selected = 0
-        for item_id, item in tqdm(iter_items(item_path), desc="Summarizing products"):
+        for item_id, item in iter_items(item_path):
             if int(item_id) < args.start:
                 continue
             if args.limit > 0 and selected >= args.limit:
@@ -295,26 +326,41 @@ def main() -> None:
             selected += 1
             if item_id in completed:
                 continue
-            images = load_product_images(item, args.max_images, args.max_image_side,
-                                         args.image_timeout)
-            error = None
-            summary = None
-            for _ in range(args.max_retries + 1):
+            yield item_id, item
+
+    def extract(entry):
+        item_id, item = entry
+        record: Dict[str, Any] = {"item_id": item_id}
+        if item.get("parent_asin"):
+            record["parent_asin"] = item["parent_asin"]
+        if item.get("text_usable") is False:
+            return dict(record, error="No usable product text", error_kind="unusable_metadata")
+        images = load_product_images(item, args.max_images, args.max_image_side, args.image_timeout)
+        error = None
+        summary = None
+        if item.get("image_status") == "available" and not images:
+            return dict(record, error="Declared local product image is unreadable", error_kind="image_error")
+        if item.get("image_status") == "download_failed":
+            return dict(record, error="Product image download failed", error_kind="image_error")
+        if not images and not args.allow_missing_images:
+            return dict(record, error="No usable product image", error_kind="image_error")
+        else:
+            for attempt in range(args.max_retries + 1):
                 try:
                     if not images and not args.allow_missing_images:
                         raise ValueError("No usable product image; use --allow_missing_images for explicit text fallback")
-                    summary = extract_json_object(
-                        model.generate(build_product_text(item)[: args.max_text_chars], images)
-                    )
+                    active_model = model
+                    if args.ollama_model and attempt:
+                        active_model = OllamaTextModel(args.ollama_model, args.ollama_url,
+                            min(args.max_new_tokens * 2**attempt, 2048), args.num_ctx, args.keep_alive, strict_schema=True)
+                    summary = extract_json_object(active_model.generate(
+                        build_product_text(item)[: args.max_text_chars], images))
                     if canonical_summary_text(summary) == "unknown product":
                         raise ValueError("Empty product attributes returned by model")
                     break
                 except Exception as exc:  # keep the catalog job resumable
                     summary = None
                     error = str(exc)
-            record: Dict[str, Any] = {"item_id": item_id}
-            if item.get("parent_asin"):
-                record["parent_asin"] = item["parent_asin"]
             if summary is not None:
                 record.update(
                     {
@@ -327,6 +373,22 @@ def main() -> None:
                 )
             else:
                 record["error"] = error or "unknown generation error"
+        return record
+
+    def ordered_parallel(entries):
+        # Keep a bounded queue instead of submitting the entire catalog.
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            pending = deque()
+            for entry in entries:
+                pending.append(pool.submit(extract, entry))
+                if len(pending) >= args.workers * 2:
+                    yield pending.popleft().result()
+            while pending:
+                yield pending.popleft().result()
+
+    records = (map(extract, selected_items()) if args.workers == 1 else ordered_parallel(selected_items()))
+    with output_path.open("a", encoding="utf-8") as output:
+        for record in tqdm(records, desc="Summarizing products"):
             output.write(json.dumps(record, ensure_ascii=False) + "\n")
             output.flush()
 

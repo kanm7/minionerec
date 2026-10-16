@@ -5,12 +5,22 @@ import torch
 from time import time
 from torch import optim
 from tqdm import tqdm
-from transformers import get_linear_schedule_with_warmup, get_constant_schedule_with_warmup
-
-from utils import ensure_dir,set_color,get_local_time,delete_file
+try:
+    from .utils import ensure_dir,set_color,get_local_time,delete_file
+except ImportError:
+    from utils import ensure_dir,set_color,get_local_time,delete_file
 import os
 
 import heapq
+import json
+from pathlib import Path
+from torch.utils.data import DataLoader
+
+try:
+    from .sid_metrics import load_items, load_popularity
+except ImportError:
+    from sid_metrics import load_items, load_popularity
+
 class Trainer(object):
 
     def __init__(self, args, model, data_num):
@@ -40,11 +50,30 @@ class Trainer(object):
 
         self.best_loss = np.inf
         self.best_collision_rate = np.inf
+        self.best_collision_loss = np.inf
         self.best_loss_ckpt = "best_loss_model.pth"
         self.best_collision_ckpt = "best_collision_model.pth"
         self.optimizer = self._build_optimizer()
         self.scheduler = self._get_scheduler()
         self.model = self.model.to(self.device)
+        self.rfsq_benchmark = getattr(getattr(self.model, "quantizer", None), "benchmark", None)
+        self.benchmark_meta = load_items(args.metrics_item_file) if getattr(args,"metrics_item_file",None) else None
+        self.benchmark_popularity = load_popularity(args.metrics_interaction_file) if getattr(args,"metrics_interaction_file",None) else None
+        self.last_sid_benchmark = None
+        self.start_epoch = 0
+        resume = getattr(args, 'resume_from_checkpoint', None)
+        if resume:
+            state = torch.load(resume, map_location=self.device, weights_only=False)
+            previous = state['args']
+            for field in ('data_path','stage_levels','layers','standardize','conditioning','latent_activation','scalar_bound','quantizer_input_clamp','batch_size','lr_scheduler_type'):
+                if getattr(previous,field,None) != getattr(args,field,None):
+                    raise ValueError(f'Resume configuration mismatch: {field}')
+            self.model.load_state_dict(state['state_dict'])
+            self.optimizer.load_state_dict(state['optimizer'])
+            self.start_epoch = state['epoch'] + 1
+            self.scheduler.last_epoch = self.start_epoch * data_num
+            self.scheduler._last_lr = [group['lr'] for group in self.optimizer.param_groups]
+            self.logger.info('Resuming after epoch %s', self.start_epoch)
 
     def _build_optimizer(self):
 
@@ -81,6 +110,7 @@ class Trainer(object):
         return optimizer
 
     def _get_scheduler(self):
+        from transformers import get_linear_schedule_with_warmup, get_constant_schedule_with_warmup
         if self.lr_scheduler_type.lower() == "linear":
             lr_scheduler = get_linear_schedule_with_warmup(optimizer=self.optimizer,
                                                            num_warmup_steps=self.warmup_steps,
@@ -128,6 +158,12 @@ class Trainer(object):
     def _valid_epoch(self, valid_data):
 
         self.model.eval()
+        if callable(self.rfsq_benchmark):
+            # Training loader shuffles. A stable complete scan is necessary to
+            # attach original item IDs, categories and popularity correctly.
+            valid_data = DataLoader(valid_data.dataset, batch_size=valid_data.batch_size,
+                                   shuffle=False, num_workers=valid_data.num_workers, drop_last=False)
+        index_batches = []
 
         iter_data =tqdm(
                 valid_data,
@@ -143,11 +179,20 @@ class Trainer(object):
             data = data.to(self.device)
             indices = self.model.get_indices(data)
             indices = indices.view(-1,indices.shape[-1]).cpu().numpy()
+            if callable(self.rfsq_benchmark): index_batches.append(indices)
             for index in indices:
                 code = "-".join([str(int(_)) for _ in index])
                 indices_set.add(code)
 
         collision_rate = (num_sample - len(list(indices_set)))/num_sample
+        if callable(self.rfsq_benchmark):
+            item_ids = getattr(valid_data.dataset, "item_ids", np.arange(num_sample))
+            self.last_sid_benchmark = self.rfsq_benchmark(np.concatenate(index_batches), item_ids,
+                item_meta=self.benchmark_meta, popularity=self.benchmark_popularity,
+                category_field=getattr(self.args,"metrics_category_field","categories"),
+                category_level=getattr(self.args,"metrics_category_level","leaf"),
+                hot_percent=getattr(self.args,"metrics_hot_cluster_percent",1.),
+                hot_multiplier=getattr(self.args,"metrics_hot_cluster_multiplier",5.))
 
         return collision_rate
 
@@ -187,8 +232,11 @@ class Trainer(object):
     def fit(self, data):
 
         cur_eval_step = 0
+        if self.start_epoch:
+            self.best_collision_rate = self._valid_epoch(data)
+            self._save_checkpoint(self.start_epoch-1, ckpt_file=self.best_collision_ckpt)
 
-        for epoch_idx in range(self.epochs):
+        for epoch_idx in range(self.start_epoch, self.epochs):
             # train
             training_start_time = time()
             train_loss, train_recon_loss = self._train_epoch(data, epoch_idx)
@@ -200,16 +248,21 @@ class Trainer(object):
 
 
             # eval
-            if (epoch_idx + 1) % self.eval_step == 0:
+            if ((epoch_idx + 1) % self.eval_step == 0 or
+                    (callable(self.rfsq_benchmark) and epoch_idx + 1 == self.epochs)):
                 valid_start_time = time()
                 collision_rate = self._valid_epoch(data)
+                if self.last_sid_benchmark is not None:
+                    self._save_sid_benchmark(epoch_idx+1)
 
                 if train_loss < self.best_loss:
                     self.best_loss = train_loss
                     self._save_checkpoint(epoch=epoch_idx, ckpt_file=self.best_loss_ckpt)
 
-                if collision_rate < self.best_collision_rate:
+                if (collision_rate < self.best_collision_rate or
+                        (collision_rate == self.best_collision_rate and train_loss < self.best_collision_loss)):
                     self.best_collision_rate = collision_rate
+                    self.best_collision_loss = train_loss
                     cur_eval_step = 0
                     self._save_checkpoint(epoch_idx, collision_rate=collision_rate,
                                           ckpt_file=self.best_collision_ckpt)
@@ -249,6 +302,21 @@ class Trainer(object):
 
 
         return self.best_loss, self.best_collision_rate
+
+    def _save_sid_benchmark(self, epoch):
+        report = dict(self.last_sid_benchmark, epoch=epoch,
+                      learning_rate=self.optimizer.param_groups[0]['lr'],
+                      scope="full embedding dataset, evaluation mode, raw RFSQ indices")
+        directory = Path(self.ckpt_dir) / "sid_benchmark"
+        directory.mkdir(parents=True,exist_ok=True)
+        text = json.dumps(report,ensure_ascii=False,indent=2)
+        (directory / f"epoch_{epoch:06d}.json").write_text(text,encoding="utf-8")
+        (directory / "latest.json").write_text(text,encoding="utf-8")
+        with (directory / "history.jsonl").open("a",encoding="utf-8") as f:
+            f.write(json.dumps(report,ensure_ascii=False)+"\n")
+        self.logger.info("RFSQ epoch %s implicit-cell occupancy=%s exclusivity=%s out-of-range=%s",epoch,
+                         [x["valid_code_occupancy_rate"] for x in report["layers"]],
+                         [x["exclusive_item_rate"] for x in report["layers"]],report["out_of_range_index_counts"])
 
 
 

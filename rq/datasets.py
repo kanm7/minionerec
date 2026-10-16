@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.utils.data as data
+from pathlib import Path
 
 
 class EmbDataset(data.Dataset):
@@ -10,21 +11,16 @@ class EmbDataset(data.Dataset):
         self.data_path = data_path
         # self.embeddings = np.fromfile(data_path, dtype=np.float32).reshape(16859,-1)
         self.embeddings = np.load(data_path)
+        mapping_path = Path(str(data_path) + ".item_ids.npy")
+        self.item_ids = np.load(mapping_path) if mapping_path.exists() else np.arange(len(self.embeddings))
+        if (self.item_ids.ndim != 1 or len(self.item_ids) != len(self.embeddings)
+                or not np.issubdtype(self.item_ids.dtype, np.integer)
+                or len(np.unique(self.item_ids)) != len(self.item_ids) or (self.item_ids < 0).any()):
+            raise ValueError("Invalid embedding row-to-item ID mapping")
+        if (self.embeddings.ndim != 2 or not len(self.embeddings) or not self.embeddings.shape[1]
+                or not np.isfinite(self.embeddings).all() or (np.linalg.norm(self.embeddings, axis=1) == 0).any()):
+            raise ValueError("SID inputs must contain finite product vectors; do not replace missing embeddings with zeros")
         
-        # Check for NaN values and handle them
-        nan_mask = np.isnan(self.embeddings)
-        if nan_mask.any():
-            print(f"Warning: Found {nan_mask.sum()} NaN values in embeddings")
-            # Replace NaN with zeros
-            self.embeddings[nan_mask] = 0.0
-            
-        # Check for infinite values
-        inf_mask = np.isinf(self.embeddings)
-        if inf_mask.any():
-            print(f"Warning: Found {inf_mask.sum()} infinite values in embeddings")
-            # Replace inf with zeros
-            self.embeddings[inf_mask] = 0.0
-
         if standardize:
             embeddings = self.embeddings.astype(np.float32)
             mean = embeddings.mean(axis=0)

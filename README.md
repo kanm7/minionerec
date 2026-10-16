@@ -52,7 +52,7 @@ in [SID_CPT_PIPELINE.md](SID_CPT_PIPELINE.md).
 <img src="./assets/minionerec_framework.png" width=100% ></img> 
 </div>
 
-- **SID Construction: MiniOneRec begins by transforming every product into a compact, semantically meaningful token.** It concatenates an item’s title and description, feeds this sentence through a frozen text encoder, and then quantises the resulting embedding with a three-level RQ-VAE.
+- **SID Construction:** The original baseline encodes title/description as text and quantizes it with RQ-VAE. The current Amazon23 `Office_Products_chrono5000` workflow instead extracts structured attributes with Qwen3-VL Instruct and uses Qwen3-VL-Embedding-8B: product image + attributes for readable images, the same encoder's text-only input for image-less products. Its embedding CLI defaults to `mixed`; RFSQ consumes the exported `Office_Products.emb-qwen-attributes-mixed-td.npy`. See [SID_CPT_PIPELINE.md](SID_CPT_PIPELINE.md) for the active dataset, commands and per-item provenance.
 
 - **SFT: With all items rewritten as SIDs, the model is first trained in a supervised fashion.** It views the chronologically ordered user history as a token sequence and learns, via next-token prediction, to generate the SID of the next product the user is likely to consume. Crucially, this stage is co-trained with a set of language-alignment objectives that map back and forth between natural language and SID space, allowing the recommender to inherit the world knowledge embedded in large language models while grounding that knowledge in discrete item codes.
 
@@ -188,7 +188,12 @@ bash data/amazon18_data_process.sh \
      --ed_month 11 \
      --output_path ./data/Amazon18
 ```
-- **2.3 Encode item text to embeddings**
+- **2.3 Original text-only baseline (historical)**
+
+For the current Amazon23 chronological subset, use
+`data/run_amazon23_chronological_embeddings.py` as documented in
+[SID_CPT_PIPELINE.md](SID_CPT_PIPELINE.md). The command below is the original
+text-only Amazon18 baseline and does not create the current mixed SID inputs.
 ```
 bash rq/amazon_text2emb.sh \
      --dataset your_dataset_type \ # e.g., Industrial 
@@ -368,3 +373,7 @@ If you find our code/paper/model helpful, please consider citing our papers 📝
 <div align="center">
 We welcome contributions from the community! 🤝
 </div>
+
+### Apple MPS / Industrial & Scientific experiments
+
+See [the reproducible workflow and measured results](docs/INDUSTRIAL_MPS_EXPERIMENT.md) for the current Qwen2.5-1.5B Base → CPT → SFT → ranking GRPO experiment, Mac-specific dependencies, data boundaries and held-out HitRate/NDCG results. Generated datasets, weights and checkpoints are kept out of Git.

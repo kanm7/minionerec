@@ -50,7 +50,10 @@ def parse_args():
     parser.add_argument("--loss_type", choices=["mse", "l1"], default="mse")
     parser.add_argument("--standardize", dest="standardize", action="store_true", default=True)
     parser.add_argument("--no-standardize", dest="standardize", action="store_false")
-    parser.add_argument("--latent_activation", choices=["tanh", "none"], default="none")
+    parser.add_argument("--latent_activation", choices=["tanh", "none"], default="tanh")
+    parser.add_argument("--scalar_bound", choices=["clamp", "legacy"], default="clamp",
+                        help="Clamp scalar level IDs before packing; legacy reproduces old unbounded checkpoints")
+    parser.add_argument("--quantizer_input_clamp", action="store_true", help="Clamp each stage input before rounding and STE")
     parser.add_argument("--dropout_prob", type=float, default=0.0)
     parser.add_argument("--bn", action="store_true")
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -59,13 +62,20 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--eval_step", type=int, default=50)
     parser.add_argument("--learner", default="AdamW")
-    parser.add_argument("--lr_scheduler_type", default="constant")
+    parser.add_argument("--lr_scheduler_type", choices=["constant", "linear"], default="constant")
     parser.add_argument("--warmup_epochs", type=int, default=50)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument(
         "--device", default="cuda:0" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument("--save_limit", type=int, default=5)
+    parser.add_argument("--resume_from_checkpoint")
+    parser.add_argument("--metrics_item_file", help="Item JSON/JSONL for implicit-cell category purity")
+    parser.add_argument("--metrics_interaction_file", help="Interaction JSONL; heat uses train records only")
+    parser.add_argument("--metrics_category_field", default="categories")
+    parser.add_argument("--metrics_category_level", choices=("leaf", "root"), default="leaf")
+    parser.add_argument("--metrics_hot_cluster_percent", type=float, default=1.)
+    parser.add_argument("--metrics_hot_cluster_multiplier", type=float, default=5.)
     return parser.parse_args()
 
 
@@ -91,9 +101,11 @@ def main():
         bn=args.bn,
         loss_type=args.loss_type,
         latent_activation=args.latent_activation,
+        scalar_bound=args.scalar_bound == "clamp",
+        input_clamp=args.quantizer_input_clamp,
     )
     print(model)
-    print("Implicit codebook sizes:", model.quantizer.codebook_sizes)
+    print("Fixed implicit stage capacities (no learned codebook):", model.quantizer.codebook_sizes)
     loader = DataLoader(
         data,
         num_workers=args.num_workers,
